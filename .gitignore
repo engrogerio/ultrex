@@ -1,0 +1,12 @@
+*.py[cod]
+build/
+dist/
+*.egg-info/
+.vscode/
+.env
+Untitled.ipynb
+/iqoptionapi-master
+*.vim*
+
+# credfile
+api/cred.py
