@@ -1,89 +1,90 @@
-import csv
+# python imports
 from datetime import datetime
 import time
 import os
-from apscheduler.schedulers.background import BackgroundScheduler
-from order import Order
-import logging
 import pdb
 import pickle
-import hashlib
+import logging
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
+# external imports
+from apscheduler.schedulers.background import BackgroundScheduler
+
+# project imports
+from order import Order
+from ultrex_csv import Csv
+
+
+logging.basicConfig(format='%(asctime)s,%(msecs)d %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s',
+datefmt='%Y-%m-%d:%H:%M:%S',
+level=logging.ERROR)
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-
 
 class Scheduler:
 
-    def __init__(self, csv_file):
-        self.csv_file = csv_file
-        self.sched = BackgroundScheduler()
-        self.sched.start()
-        self.connection = Order.get_connection()
-        self.csv_hash = self.get_csv_hash()
+    def __init__(self):
+        # A Scheduler just needs a csv file to start
+        self.schedule = BackgroundScheduler()
+        self.iqoption_connection = Order.get_connection()
+        self.start()
+
+    def start(self):
+        self.schedule.start()
 
     def run_orders(self, *orders):
         for order in orders:
             try:
-                response = order.run_commit(self.connection)
+                response = order.run_commit(self.iqoption_connection)
             except Exception as ex:
                 logger.error(ex)
 
-    def add_schedule(self, orders_dic):
-        for timestamp, orders in orders_dic.items():
-            self.sched.add_job(self.run_orders, trigger='date',
-                               run_date=timestamp, args=orders)
+    def add_schedule(self, order):
+        self.schedule.add_job(self.run_orders, trigger='date',
+                            run_date=order.timestamp, args=[order])
 
     def stop_schedule(self):
         # Not strictly necessary if daemonic mode is enabled but
         # should be done if possible
-        self.sched.shutdown()
+        self.schedule.shutdown()
 
-    def get_order_from_csv_line(self, line):
-        order_dic = {}
-        order_dic['timestamp'] = line[0]
-        order_dic['amount'] = float(line[1])
-        order_dic['asset'] = line[2]
-        order_dic['action'] = line[3]
-        order_dic['duration'] = int(line[4])
-        order_dic['gale_value'] = line[5]
-        order = Order.from_dict(order_dic)
-        return order
+    def schedule_list_content(self, lines_list):
 
-    def schedule_csv(self):
-        orders = []
-        orders_dic = {}
-        with open(self.csv_file) as csv_file:
-            csv_reader = csv.reader(csv_file, delimiter=',')
-            for n, line in enumerate(csv_reader):
-                logger.info(f'Creating order from csv item {n}')
-                order = self.get_order_from_csv_line(line)
-                if orders_dic.get(order.timestamp):
-                    orders_dic[order.timestamp].append(order)
-                else:
-                    orders_dic[order.timestamp] = [order]
-                logger.info(f'Scheduling line {line}')
+        """
+        Read a list and send the data to
+        be run on a schedule.
+        """
+        print('*********', lines_list)
+        for key, line in enumerate(lines_list):
+            order = Order.from_dict(line)
+            logger.info(f"Scheduling item {key} - {line['asset']}")
+            self.add_schedule(order)
 
-            self.add_schedule(orders_dic)
+    def schedule_csv_content(self, csv_file):
+        """
+        Read a csv file and send the data to
+        be run on a schedule.
+        """
+        self.schedule_list_content(csv_file.to_dict().items())
 
-    def get_csv_hash(self):
-        with open(self.csv_file, 'rb') as csv_file:
-            checksum = hashlib.sha1(csv_file.read()).hexdigest()
-        return checksum
+def main_test():
+    from datetime import datetime
+    sc = Scheduler()
+    schedule = [datetime.now().strftime("%Y-%m-%d %H:%M:%S"),'EURUSD-OTC','CALL',1,1]
+    sc.schedule_list_content(schedule)
 
+def main_prod():
 
-if __name__ == '__main__':
-    import os
-    FOLDER = os.path.dirname(os.path.abspath(__file__))
-    file = os.path.join(FOLDER, 'data.csv')
-    sc = Scheduler(file)
-    file_hash = sc.get_csv_hash()
-    sc.schedule_csv()
+    csv_file = Csv()
+    sc = Scheduler()
+    file_hash = csv_file.get_csv_hash()
+    sc.schedule_csv_content(csv_file)
+
     while True:
-        if sc.get_csv_hash() != sc.csv_hash:
-            sc.csv_hash = sc.get_csv_hash()
-            logger.info('CSV file has changed @{datetime.now()} - hash{sc.csv_hash}!')
-            sc.schedule_csv()
-        # time.sleep(20)
-        # print(f'Waiting {datetime.now()}')
+        # check if the file has changed
+        if csv_file.get_csv_hash() != file_hash:
+            file_hash = csv_file.get_csv_hash()
+            logger.info(f'CSV file has changed @{datetime.now()} - hash: {file_hash}!')
+            sc.schedule_csv_content(csv_file)
+        # time.sleep(10)
+
+if __name__ == "__main__":
+    main_prod()

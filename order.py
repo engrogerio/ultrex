@@ -1,15 +1,21 @@
+# python imports
 import pdb
 import threading
 import logging
-import database
+import time
 from datetime import datetime
-from api.utils import OptionApi
 from threading import Thread
 
+# external libraries
+from api.utils import iqoption_connection
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
+# local imports
+import database
+
+logging.basicConfig(format='%(asctime)s,%(msecs)d %(levelname)-8s [%(filename)s:%(lineno)d] %(message)s',
+datefmt='%Y-%m-%d:%H:%M:%S',
+level=logging.ERROR)
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
 
 class Order:
@@ -51,31 +57,29 @@ class Order:
 
     @classmethod
     def get_connection(cls):
-        return OptionApi().get_connection()
+        return iqoption_connection()
 
     @classmethod
     def from_dict(cls, adict):
         timestamp = adict['timestamp']
         asset = adict['asset']
-        amount = adict['amount']
+        amount = float(adict['amount'])
         action = adict['action']
-        duration = adict['duration']
+        duration = int(adict['duration'])
         gale_value = adict['gale_value']
         return Order(timestamp, asset, amount, action,
                      duration, gale_value)
 
-    def set_order_response(self, connection):
-        response = connection.get_async_order(self.id).get('position-changed').get('msg')
-        self.asset = response.get('raw_event').get('active')
-        self.amount = response.get('raw_event').get('amount')
-        self.action = response.get('raw_event').get('direction')
-        self.duration = response.get('close_time') - response.get('open_time')
-        # self.id = response.get('external_id')
-        self.status = response.get('status')
-        self.open_time = str(datetime.fromtimestamp(int(response.get('open_time'))/1000))
-        self.close_time = str(datetime.fromtimestamp(int(response.get('close_time'))/1000))
-        self.open_quote = response.get('open_quote')
-        self.close_quote = response.get('close_quote')
+    def set_order_response(self, response_msg):
+        self.asset = response_msg.get('raw_event').get('active')
+        self.amount = response_msg.get('raw_event').get('amount')
+        self.action = response_msg.get('raw_event').get('direction')
+        self.duration = response_msg.get('close_time') - response_msg.get('open_time')
+        self.status = response_msg.get('status')
+        self.open_time = str(datetime.fromtimestamp(int(response_msg.get('open_time'))/1000))
+        self.close_time = str(datetime.fromtimestamp(int(response_msg.get('close_time'))/1000))
+        self.open_quote = response_msg.get('open_quote')
+        self.close_quote = response_msg.get('close_quote')
         if self.action == 'put':
             self.result = 'win' if self.close_quote > self.open_quote else 'loose'
         else:
@@ -91,75 +95,84 @@ class Order:
         availables['digital'] = [asset for asset, value in digital.items() if value['open']]
         return availables
 
-    def commit(self, connection):
-        """
-        Commit the order and wait for a response.
-        Also, save the response data.
-        This method will run on a new thread.
-        Args:
-            asset: Name of the asset for the order_data
-            amount: Value in BRL for the order_data
-            action: call or put
-            duration: Minutes before closing the order_data.
-
-        Return:
-            API Response
-
-        Raise:
-            None
-
-        """
-
-        logger.info(f"ordering: trade {self.asset} - {self.amount} - {self.action} - {self.duration}")
-
-        success = False
-        id = 0
-        # Try binary first
-        logger.info(f'Trying order {self.action} {self.asset} in binary...{threading.currentThread().getName()}')
+    def buy_binary(self, connection):
         try:
-            success, id = connection.buy(self.amount, self.asset, self.action.lower(), self.duration)
+            success, iq_id = connection.buy(
+                self.amount, self.asset, self.action.lower(), self.duration)
+            if success:
+                logger.info(f'binary = {iq_id} - order placed')
+            return {"success": success, "id": iq_id}
+
+        except Exception as ex:
+            logger.error(ex)
+            return {"success": False, "error": ex}
+
+    def buy_digital(self, connection):
+        try:
+            success, iq_id = connection.buy_digital_spot(
+                self.asset, self.amount, self.action.lower(), self.duration)
+            if success:
+                logger.info(f'digital ={iq_id} - order placed')
+            return {"success": success, "id": iq_id}
+
+        except Exception as ex:
+            logger.error(ex)
+            return {"success": False, "error": ex}
+
+    def get_async_order_response(self, connection, iq_id):
+        logger.debug(connection.get_async_order(iq_id))
+        return connection.get_async_order(iq_id)
+
+    def commit(self, connection):
+
+        # Try binary first
+        iq_result = {}
+
+        try:
+            iq_result = self.buy_binary(connection)
+
         except Exception as ex:
             logger.error(ex)
 
-        if success:
-            logger.info(f'Binary order_data was placed with id {id}.')
-
-        else:
-            logger.info(f'Trying order {self.action} {self.asset} in digital {threading.currentThread().getName()}...')
+        if not iq_result.get('success', False):
+            # binary did not go through. Trying digital
             try:
-                success, id = connection.buy_digital_spot(self.asset, self.amount, self.action.lower(), self.duration)
+                iq_result = self.buy_digital(connection)
+
             except Exception as ex:
                 logger.error(ex)
-            if success:
-                logger.info(f'Digital order was placed with id {id}.')
 
-            else:
-                logger.warning(f'The asset {self.asset} could not be ordered today due to {id["message"]}!')
+        if iq_result.get('success', False):
+            # if any succeed, waits for API get ready.
+            print(f'waiting thread {threading.currentThread().getName()}')
+            while not self.get_async_order_response(connection, iq_result['id']):
+                time.sleep(10)
+                pass
 
-        if success:
-            # waits for API get ready
-            logger.info(f'Waiting for response for id {id} on thread {threading.currentThread().getName()}!')
-            while not connection.get_async_order(id):
-                pass  # do nothing
-
-            logger.info(f'Waiting for closed order id {id} on thread {threading.currentThread().getName()}!')
+            # waits for the order to close.
+            logger.debug(f'started thread {threading.currentThread().getName()}')
             state = 'open'
             while state != 'closed':
                 try:
-                    state = connection.get_async_order(id).get('position-changed', '').get('msg', '').get('status', '')
+                    response = self.get_async_order_response(connection, iq_result['id']).get('position-changed')
+                    state = response.get('msg').get('status')
                 except Exception as ex:
+                    log.error(f'raised exception {ex}')
                     state = 'open'
+            logger.debut(f'ended order thread {threading.currentThread().getName()}')
 
-            self.id = id
-            self.set_order_response(connection)
-            logger.info(f'Order {id} placed on thread {threading.currentThread().getName()}!', self.to_dict())
+            # saves data back to the self
+            self.set_order_response(response.get('msg'))
+
             response = {'message': self.to_dict()}
+
             # save closed order data
-            database.save(connection.get_async_order(id)) #self.to_dict())
+            database.save(self.to_dict()) #connection.get_async_order(id))
         else:
-            response = id
+            response = iq_result.get('id')
         return response
 
     def run_commit(self, connection):
         t = Thread(target=self.commit, args=(connection,))
         t.start()
+
